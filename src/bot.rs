@@ -1314,7 +1314,7 @@ pub async fn get_auto_mint_info_from_url(
     if let Ok(response) = res {
         if let Ok(data) = response.json::<serde_json::Value>().await {
             let result: TokenResult = serde_json::from_value(data)?;
-            tracing::info!("fetched hot_tokens result: {:?}", result);
+            // tracing::info!("fetched hot_tokens result: {:?}", result);
             
             let json_str = serde_json::to_string_pretty(&result)?;
             fs::write("routing.json", &json_str)?;
