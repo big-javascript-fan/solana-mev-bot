@@ -233,21 +233,8 @@ struct OnchainTelemetry {
     total_fee_lamports: u64,
     total_real_profit: i64,
     total_net_pnl: i64,
-}
-
-#[derive(Debug, Serialize)]
-struct ExecutionLogRecord {
-    ts: String,
-    signature: String,
-    route_key: u64,
-    endpoint_index: usize,
-    confirmed: bool,
-    succeeded: bool,
-    timeout: bool,
-    fee_lamports: u64,
-    real_profit: i64,
-    net_pnl: i64,
-    sent_at_ms: u128,
+    total_profit_lamports: i64,
+    total_loss_lamports: i64,
 }
 
 fn extract_real_profit(logs: &[String]) -> i64 {
@@ -279,11 +266,8 @@ fn extract_real_profit(logs: &[String]) -> i64 {
 async fn track_onchain_result(
     rpc_client: Arc<RpcClient>,
     signature: Signature,
-    route_key: u64,
-    endpoint_index: usize,
     telemetry: Arc<Mutex<OnchainTelemetry>>
 ) {
-    let sent_at = Instant::now();
     let mut confirmed = false;
     let mut succeeded = false;
     let mut timeout = false;
@@ -348,29 +332,10 @@ async fn track_onchain_result(
         guard.total_fee_lamports = guard.total_fee_lamports.saturating_add(fee_lamports);
         guard.total_real_profit += real_profit;
         guard.total_net_pnl += net_pnl;
-    }
-
-    let record = ExecutionLogRecord {
-        ts: Utc::now().to_rfc3339(),
-        signature: signature.to_string(),
-        route_key,
-        endpoint_index,
-        confirmed,
-        succeeded,
-        timeout,
-        fee_lamports,
-        real_profit,
-        net_pnl,
-        sent_at_ms: sent_at.elapsed().as_millis(),
-    };
-    if
-        let Ok(mut file) = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("execution_log.jsonl").await
-    {
-        if let Ok(line) = serde_json::to_string(&record) {
-            let _ = file.write_all(format!("{}\n", line).as_bytes()).await;
+        if net_pnl >= 0 {
+            guard.total_profit_lamports += net_pnl;
+        } else {
+            guard.total_loss_lamports += -net_pnl;
         }
     }
 }
@@ -594,15 +559,12 @@ pub async fn run_spam_mode(
                                 endpoint_stats[i].0 += 1;
                                 info!("Transaction sent successfully through RPC client {}: {}", i, sig);
                                 let sig_to_track = sig;
-                                let route_key = key;
                                 let tracker_rpc = rpc_client.clone();
                                 let tracker_telemetry = onchain_telemetry.clone();
                                 tokio::spawn(async move {
                                     track_onchain_result(
                                         tracker_rpc,
                                         sig_to_track,
-                                        route_key,
-                                        i,
                                         tracker_telemetry
                                     ).await;
                                 });
@@ -654,17 +616,17 @@ pub async fn run_spam_mode(
             } else {
                 (onchain.confirmed_ok as f64) / (confirmed_total as f64)
             };
+            // info!(
+            //     "telemetry profile={} attempted={} ok={} err={} cooldown_skips={} success_rate={:.2}",
+            //     profile,
+            //     telemetry.attempted,
+            //     telemetry.ok,
+            //     telemetry.err,
+            //     telemetry.cooldown_skips,
+            //     rate
+            // );
             info!(
-                "telemetry profile={} attempted={} ok={} err={} cooldown_skips={} success_rate={:.2}",
-                profile,
-                telemetry.attempted,
-                telemetry.ok,
-                telemetry.err,
-                telemetry.cooldown_skips,
-                rate
-            );
-            info!(
-                "onchain confirmed_ok={} confirmed_err={} confirm_timeout={} confirm_rate={:.2} pnl_success_rate={:.2} fee_lamports={} real_profit={} net_pnl={}",
+                "onchain confirmed_ok={} confirmed_err={} confirm_timeout={} confirm_rate={:.2} pnl_success_rate={:.2} total_fee={} total_real_profit={} total_profit={} total_loss={} net_pnl={}",
                 onchain.confirmed_ok,
                 onchain.confirmed_err,
                 onchain.confirm_timeout,
@@ -672,6 +634,8 @@ pub async fn run_spam_mode(
                 pnl_success_rate,
                 onchain.total_fee_lamports,
                 onchain.total_real_profit,
+                onchain.total_profit_lamports,
+                onchain.total_loss_lamports,
                 onchain.total_net_pnl
             );
             last_telemetry_log = Instant::now();
