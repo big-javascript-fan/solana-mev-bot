@@ -781,7 +781,7 @@ pub async fn get_hot_mints() -> Result<Vec<MarketsGroupInfo>> {
     if let Ok(response) = res {
         if let Ok(data) = response.json::<serde_json::Value>().await {
             let result: TokenResult = serde_json::from_value(data)?;
-            
+            // tracing::info!("fetched hot_tokens result: {:?}", result);
             let json_str = serde_json::to_string_pretty(&result)?;
             fs::write("hot_tokens.json", json_str)?;
             for arb_mint_info in result.arb_mint_info {
@@ -1184,6 +1184,7 @@ pub async fn get_auto_mint_info_result(config: &Config) -> anyhow::Result<Routin
     if let Ok(response) = res {
         if let Ok(data) = response.json::<serde_json::Value>().await {
             let result: TokenResult = serde_json::from_value(data)?;
+            // tracing::info!("fetched hot_tokens result: {:?}", result);
             
             let json_str = serde_json::to_string_pretty(&result)?;
             fs::write("routing.json", json_str)?;
@@ -1255,6 +1256,7 @@ pub async fn get_tokens_info_by_query(
     if let Ok(response) = res {
         if let Ok(data) = response.json::<serde_json::Value>().await {
             let result: TokenResult = serde_json::from_value(data)?;
+            // tracing::info!("fetched hot_tokens result: {:?}", result);
             
             let json_str = serde_json::to_string_pretty(&result)?;
             if result.count > 0 {
@@ -1294,7 +1296,7 @@ pub async fn get_auto_mint_info_from_url(
         ignore_offchain_bots: Some(WHITELIST_ONLY_DEFAULT_VALUE),
     });
     let query = format!(
-        "limit={}&maxPoolLen=4&minTxLen={}&minPoolWsolLiquidity={}&maxPoolWsolLiquidity={}&duration={}&minProfit={}&minProfitPerArb={}&minRoi={}&isWhitelisted={}",
+        "limit={}&maxPoolLen=10&minTxLen={}&minPoolWsolLiquidity={}&maxPoolWsolLiquidity={}&duration={}&minProfit={}&minProfitPerArb={}&minRoi={}&isWhitelisted={}",
         auto_filter.limit.unwrap_or(MINTS_LIMIT_DEFAULT_VALUE),
         auto_filter.min_tx_len.unwrap_or(MIN_TX_LEN_DEFAULT_VALUE),
         auto_filter.min_pool_wsol_liquidity.unwrap_or(MIN_POOL_WSOL_LIQUIDITY_DEFAULT_VALUE),
@@ -1312,6 +1314,7 @@ pub async fn get_auto_mint_info_from_url(
     if let Ok(response) = res {
         if let Ok(data) = response.json::<serde_json::Value>().await {
             let result: TokenResult = serde_json::from_value(data)?;
+            tracing::info!("fetched hot_tokens result: {:?}", result);
             
             let json_str = serde_json::to_string_pretty(&result)?;
             fs::write("routing.json", &json_str)?;
