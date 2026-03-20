@@ -46,6 +46,7 @@ serde_json = "1.0.141"
 base64 = "0.22.1"
 reqwest = { version = "0.12.22", features = ["json"] }
 solana-account-decoder-client-types = "2.3.6"
+solana-transaction-status-client-types = "2.3.13"
 solana-system-interface = "1.0.0"
 futures = "0.3.31"
 tracing-appender = "0.2.3"

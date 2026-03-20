@@ -31,13 +31,14 @@ use solana_client::rpc_client::RpcClient;
 use solana_client::rpc_filter::MemcmpEncodedBytes;
 use solana_client::rpc_request::TokenAccountsFilter;
 use solana_client::rpc_response::RpcKeyedAccount;
+use solana_client::rpc_config::RpcTransactionConfig;
 use solana_sdk::address_lookup_table::{ AddressLookupTableAccount };
 use solana_sdk::commitment_config::CommitmentLevel;
 use solana_sdk::hash::Hash;
 use solana_sdk::instruction::{ AccountMeta, Instruction, InstructionError };
 use solana_sdk::message::v0::Message;
 use solana_sdk::pubkey::Pubkey;
-use solana_sdk::signature::Keypair;
+use solana_sdk::signature::{ Keypair, Signature };
 use solana_sdk::signer::Signer;
 use solana_sdk::system_instruction::transfer;
 use solana_sdk::transaction::{ Transaction, TransactionError, VersionedTransaction };
@@ -81,6 +82,10 @@ use axum::{ routing::{ get }, Json, Router, extract::{ State, Query } };
 use rand::Rng;
 use tokio::io::AsyncWriteExt;
 use rand::prelude::IndexedRandom;
+use solana_transaction_status_client_types::{
+    UiTransactionEncoding,
+    option_serializer::OptionSerializer,
+};
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -220,6 +225,156 @@ struct SendTelemetry {
     cooldown_skips: u64,
 }
 
+#[derive(Debug, Default)]
+struct OnchainTelemetry {
+    confirmed_ok: u64,
+    confirmed_err: u64,
+    confirm_timeout: u64,
+    total_fee_lamports: u64,
+    total_real_profit: i64,
+    total_net_pnl: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct ExecutionLogRecord {
+    ts: String,
+    signature: String,
+    route_key: u64,
+    endpoint_index: usize,
+    confirmed: bool,
+    succeeded: bool,
+    timeout: bool,
+    fee_lamports: u64,
+    real_profit: i64,
+    net_pnl: i64,
+    sent_at_ms: u128,
+}
+
+fn extract_real_profit(logs: &[String]) -> i64 {
+    for log in logs {
+        if let Some(idx) = log.find("real_profit") {
+            let tail = &log[idx..];
+            let mut started = false;
+            let mut num = String::new();
+            for ch in tail.chars() {
+                if !started {
+                    if ch == '-' || ch.is_ascii_digit() {
+                        started = true;
+                        num.push(ch);
+                    }
+                } else if ch.is_ascii_digit() {
+                    num.push(ch);
+                } else {
+                    break;
+                }
+            }
+            if let Ok(value) = num.parse::<i64>() {
+                return value;
+            }
+        }
+    }
+    0
+}
+
+async fn track_onchain_result(
+    rpc_client: Arc<RpcClient>,
+    signature: Signature,
+    route_key: u64,
+    endpoint_index: usize,
+    telemetry: Arc<Mutex<OnchainTelemetry>>
+) {
+    let sent_at = Instant::now();
+    let mut confirmed = false;
+    let mut succeeded = false;
+    let mut timeout = false;
+    let mut fee_lamports: u64 = 0;
+    let mut real_profit: i64 = 0;
+    let mut saw_status = false;
+
+    for _ in 0..40 {
+        match rpc_client.get_signature_statuses(&[signature]) {
+            Ok(resp) => {
+                if let Some(Some(status)) = resp.value.first() {
+                    saw_status = true;
+                    if status.err.is_none() {
+                        confirmed = true;
+                        succeeded = true;
+                    } else {
+                        confirmed = true;
+                        succeeded = false;
+                    }
+                    break;
+                }
+            }
+            Err(_) => {}
+        }
+        sleep(Duration::from_millis(500)).await;
+    }
+
+    if !saw_status {
+        timeout = true;
+    }
+
+    if confirmed {
+        if
+            let Ok(tx) = rpc_client.get_transaction_with_config(
+                &signature,
+                RpcTransactionConfig {
+                    encoding: Some(UiTransactionEncoding::Json),
+                    commitment: Some(CommitmentConfig::confirmed()),
+                    max_supported_transaction_version: Some(0),
+                }
+            )
+        {
+            if let Some(meta) = tx.transaction.meta {
+                fee_lamports = meta.fee;
+                if let OptionSerializer::Some(logs) = meta.log_messages {
+                    real_profit = extract_real_profit(&logs);
+                }
+            }
+        }
+    }
+    let net_pnl = real_profit - (fee_lamports as i64);
+
+    {
+        let mut guard = telemetry.lock().await;
+        if timeout {
+            guard.confirm_timeout += 1;
+        } else if confirmed && succeeded {
+            guard.confirmed_ok += 1;
+        } else if confirmed {
+            guard.confirmed_err += 1;
+        }
+        guard.total_fee_lamports = guard.total_fee_lamports.saturating_add(fee_lamports);
+        guard.total_real_profit += real_profit;
+        guard.total_net_pnl += net_pnl;
+    }
+
+    let record = ExecutionLogRecord {
+        ts: Utc::now().to_rfc3339(),
+        signature: signature.to_string(),
+        route_key,
+        endpoint_index,
+        confirmed,
+        succeeded,
+        timeout,
+        fee_lamports,
+        real_profit,
+        net_pnl,
+        sent_at_ms: sent_at.elapsed().as_millis(),
+    };
+    if
+        let Ok(mut file) = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("execution_log.jsonl").await
+    {
+        if let Ok(line) = serde_json::to_string(&record) {
+            let _ = file.write_all(format!("{}\n", line).as_bytes()).await;
+        }
+    }
+}
+
 fn route_key(ix: &Instruction) -> u64 {
     let mut hasher = DefaultHasher::new();
     StdHash::hash(&ix.program_id, &mut hasher);
@@ -277,6 +432,7 @@ pub async fn run_spam_mode(
     let mut route_cooldowns: HashMap<u64, Instant> = HashMap::new();
     let mut endpoint_stats: Vec<(u64, u64)> = vec![(0, 0); sending_rpc_clients.len()];
     let mut telemetry = SendTelemetry::default();
+    let onchain_telemetry = Arc::new(Mutex::new(OnchainTelemetry::default()));
     let mut last_telemetry_log = Instant::now();
 
     let run_after_simulation_profit = config.bot.run_after_simulation_profit.unwrap_or_default();
@@ -437,6 +593,19 @@ pub async fn run_spam_mode(
                                 telemetry.ok += 1;
                                 endpoint_stats[i].0 += 1;
                                 info!("Transaction sent successfully through RPC client {}: {}", i, sig);
+                                let sig_to_track = sig;
+                                let route_key = key;
+                                let tracker_rpc = rpc_client.clone();
+                                let tracker_telemetry = onchain_telemetry.clone();
+                                tokio::spawn(async move {
+                                    track_onchain_result(
+                                        tracker_rpc,
+                                        sig_to_track,
+                                        route_key,
+                                        i,
+                                        tracker_telemetry
+                                    ).await;
+                                });
                             }
                             Err(_) => {
                                 telemetry.err += 1;
@@ -473,6 +642,18 @@ pub async fn run_spam_mode(
         if last_telemetry_log.elapsed() >= Duration::from_secs(5) {
             let rate =
                 if telemetry.attempted == 0 { 0.0 } else { (telemetry.ok as f64) / (telemetry.attempted as f64) };
+            let onchain = onchain_telemetry.lock().await;
+            let confirmed_total = onchain.confirmed_ok + onchain.confirmed_err;
+            let confirm_rate = if telemetry.ok == 0 {
+                0.0
+            } else {
+                (confirmed_total as f64) / (telemetry.ok as f64)
+            };
+            let pnl_success_rate = if confirmed_total == 0 {
+                0.0
+            } else {
+                (onchain.confirmed_ok as f64) / (confirmed_total as f64)
+            };
             info!(
                 "telemetry profile={} attempted={} ok={} err={} cooldown_skips={} success_rate={:.2}",
                 profile,
@@ -481,6 +662,17 @@ pub async fn run_spam_mode(
                 telemetry.err,
                 telemetry.cooldown_skips,
                 rate
+            );
+            info!(
+                "onchain confirmed_ok={} confirmed_err={} confirm_timeout={} confirm_rate={:.2} pnl_success_rate={:.2} fee_lamports={} real_profit={} net_pnl={}",
+                onchain.confirmed_ok,
+                onchain.confirmed_err,
+                onchain.confirm_timeout,
+                confirm_rate,
+                pnl_success_rate,
+                onchain.total_fee_lamports,
+                onchain.total_real_profit,
+                onchain.total_net_pnl
             );
             last_telemetry_log = Instant::now();
         }
